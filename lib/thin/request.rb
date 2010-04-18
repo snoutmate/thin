@@ -10,6 +10,7 @@ module Thin
     # Maximum request body size before it is moved out of memory
     # and into a tempfile for reading.
     MAX_BODY          = 1024 * (80 + 32)
+
     BODY_TMPFILE      = 'thin-body'.freeze
     MAX_HEADER        = 1024 * (80 + 32)
     
@@ -53,6 +54,10 @@ module Thin
       @data     = ''
       @nparsed  = 0
       @body     = StringIO.new(INITIAL_BODY.dup)
+
+      @chunked_body     = StringIO.new(INITIAL_BODY.dup)
+      @chunked_finished = false
+
       @env      = {
         SERVER_SOFTWARE   => SERVER,
         SERVER_NAME       => LOCALHOST,
@@ -69,12 +74,55 @@ module Thin
       }
     end
 
+    # TODO: presunout @chunked_body z pameti na disk ?
+
+    def try_to_parse_chunked_body
+      @dechunked_body = StringIO.new("")
+      @chunked_body.rewind()
+
+      begin
+        while (true)
+          sizeline = @chunked_body.readline()
+          size = sizeline.to_i(16)
+          break if size == 0 # konec chunkovaneho souboru
+
+          @dechunked_body << @chunked_body.read(size)
+          @chunked_body.read(2) # \r\n po kazdem bloku
+        end
+        @chunked_finished = true
+        @chunked_body = nil
+
+        @dechunked_body.rewind
+        @env[RACK_INPUT] = @dechunked_body
+      rescue
+        @chunked_finished = false
+      ensure
+        @chunked_body.seek(0,IO::SEEK_END) if @chunked_body
+      end
+
+    end
+
+    def add_chunked_piece(data)
+      @chunked_body << data
+      expected_length = @env["HTTP_X_EXPECTED_ENTITY_LENGTH"].to_i rescue 0
+
+      try_to_parse_chunked_body if (@chunked_body.size >= expected_length)
+    end
+
     # Parse a chunk of data into the request environment
     # Raises a +InvalidRequest+ if invalid.
     # Returns +true+ if the parsing is complete.
     def parse(data)
       if @parser.finished?  # Header finished, can only be some more body
-        body << data
+        if (chunked_input?)
+          if (@chunked_body.size == 0) # zacatek, zpracovat data co byla uz predtim nactena v @body
+            @body.rewind
+            add_chunked_piece(@body.read(@body.size))
+          end
+          add_chunked_piece(data)
+        else
+          body << data
+        end
       else                  # Parse more header using the super parser
         @data << data
         raise InvalidRequest, 'Header longer than allowed' if @data.size > MAX_HEADER
@@ -84,7 +132,6 @@ module Thin
         # Transfert to a tempfile if body is very big
         move_body_to_tempfile if @parser.finished? && content_length > MAX_BODY
       end
-
 
       if finished?   # Check if header and body are complete
         @data = nil
@@ -97,7 +144,15 @@ module Thin
 
     # +true+ if headers and body are finished parsing
     def finished?
-      @parser.finished? && @body.size >= content_length
+      if (chunked_input?)
+        @chunked_finished
+      else
+        @parser.finished? && @body.size >= content_length
+      end
+    end
+
+    def chunked_input?
+      @env["HTTP_TRANSFER_ENCODING"] == "Chunked"
     end
 
     # Expected size of the body
